@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# neoepitope_pipeline.sh
+# RNA-seq → variant calling → VEP (with TSL) → pVACseq neoepitopes (MHC Class I / MHCflurry)
+
+set -Eeuo pipefail
+
+# ================
+# 0) CONFIGURATION
+# ================
+PROJECT="/rg/bioinf-kahraman/projects/neoepitope_eymen"
+WORKDIR="$PROJECT/data/PRJEB2449"
+OUTDIR="$WORKDIR/pipeline_out"
+mkdir -p "$OUTDIR" "$WORKDIR" "$PROJECT/results" "$PROJECT/reference_genome"
+
+# Sample + HLA alleles (comma-separated, no spaces)
+SAMPLE="ERR031019"
+HLA_LIST="HLA-A*02:01,HLA-A*24:02,HLA-B*07:02,HLA-B*15:01,HLA-C*07:02,HLA-C*07:01"
+
+# Input FASTQs (if you want to realign). If missing, the script will skip to using an existing BAM.
+R1="/home/gdediler/data/fastq/sample_R1.fastq.gz"
+R2="/home/gdediler/data/fastq/sample_R2.fastq.gz"
+# If you already have a coordinate-sorted BAM, set it here and leave R1/R2 absent or empty.
+# BAM_SORTED="/path/to/existing/Aligned.sortedByCoord.out.bam"
+
+# References (consistent with your logs)
+REF_FA="/rg/bioinf-kahraman/database/ensembl/v114/Homo_sapiens.GRCh38.dna.toplevel.fa"
+GTF="/home/gdediler/Homo_sapiens.GRCh38.114.gtf"
+STAR_INDEX="$PROJECT/star_ensembl114"   # already built here previously
+
+# VEP cache directory
+VEP_CACHE="$PROJECT/vep_cache"
+
+# Conda environments
+ENV_ALIGN="star_env"   # STAR + samtools
+ENV_GATK="bio_env"     # gatk4 + samtools
+ENV_VEP="neoepi"       # ensembl-vep + bcftools/samtools
+ENV_PVAC="neoepi"      # pvactools + mhcflurry (downloads pre-fetched)
+
+# Threading and STAR splice overhang
+THREADS=16
+OVERHANG=100           # read length - 1 (safe default)
+
+# =================
+# Helper functions
+# =================
+log(){ printf "[%s] %s\n" "$(date '+%F %T')" "$*" >&2; }
+die(){ printf "[%s] ERROR: %s\n" "$(date '+%F %T')" "$*" >&2; exit 1; }
+
+activate_env(){
+  # Robust conda activation for non-interactive shells
+  if ! command -v conda >/dev/null 2>&1; then
+    die "conda not found on PATH."
+  fi
+  # shellcheck disable=SC1091
+  source "$(conda info --base)/etc/profile.d/conda.sh"
+  conda activate "$1"
+}
+
+require_files(){
+  for f in "$@"; do
+    [ -s "$f" ] || die "Required file not found or empty: $f"
+  done
+}
+
+trap 'die "Pipeline aborted at line $LINENO."' ERR
+
+# =========================================
+# 1) STAR GENOME INDEX (skipped if present)
+# =========================================
+if [ ! -e "$STAR_INDEX/Genome" ]; then
+  log "Creating STAR genome index (once per reference build)..."
+  activate_env "$ENV_ALIGN"
+  mkdir -p "$STAR_INDEX"
+  require_files "$REF_FA" "$GTF"
+  STAR --runThreadN "$THREADS" --runMode genomeGenerate \
+       --genomeDir "$STAR_INDEX" \
+       --genomeFastaFiles "$REF_FA" \
+       --sjdbGTFfile "$GTF" \
+       --sjdbOverhang "$OVERHANG"
+else
+  log "STAR index found — skipping index generation."
+fi
+
+# =========================================
+# 2) READ ALIGNMENT (or reuse existing BAM)
+# =========================================
+BAM_SORTED_DEFAULT="$OUTDIR/${SAMPLE}.Aligned.sortedByCoord.out.bam"
+if [ -n "${R1:-}" ] && [ -n "${R2:-}" ] && [ -s "${R1:-/dev/null}" ] && [ -s "${R2:-/dev/null}" ]; then
+  log "FASTQs detected — running STAR alignment in 2-pass mode..."
+  activate_env "$ENV_ALIGN"
+  require_files "$REF_FA" "$GTF" "$R1" "$R2"
+  STAR --runThreadN "$THREADS" \
+       --genomeDir "$STAR_INDEX" \
+       --readFilesIn "$R1" "$R2" \
+       --readFilesCommand zcat \
+       --twopassMode Basic \
+       --outSAMtype BAM SortedByCoordinate \
+       --outFileNamePrefix "$OUTDIR/${SAMPLE}."
+  samtools index "$BAM_SORTED_DEFAULT"
+  BAM_SORTED="$BAM_SORTED_DEFAULT"
+else
+  if [ -n "${BAM_SORTED:-}" ] && [ -s "$BAM_SORTED" ]; then
+    log "Using existing coordinate-sorted BAM: $BAM_SORTED"
+  else
+    die "No FASTQs provided and no existing BAM set. Provide R1/R2 or set BAM_SORTED."
+  fi
+fi
+
+# Ensure reference FASTA has a .fai index
+if [ ! -e "${REF_FA}.fai" ]; then
+  log "Indexing reference FASTA (.fai)..."
+  activate_env "$ENV_ALIGN"
+  samtools faidx "$REF_FA"
+fi
+
+# ===================================================
+# 3) PREPARE BAM FOR GATK: Read Groups + Duplicates
+# ===================================================
+log "Adding/replacing read groups (required by GATK tools)..."
+BAM_RG="$OUTDIR/${SAMPLE}.rg.bam"
+activate_env "$ENV_ALIGN"
+samtools addreplacerg \
+  -r "@RG\tID:${SAMPLE}\tSM:${SAMPLE}\tPL:ILLUMINA" \
+  -o "$BAM_RG" "$BAM_SORTED"
+samtools index "$BAM_RG"
+
+log "Marking duplicates (Spark if available, fallback to standard)..."
+BAM_DEDUP="$OUTDIR/${SAMPLE}.dedup.bam"
+activate_env "$ENV_GATK"
+gatk MarkDuplicatesSpark \
+  -I "$BAM_RG" \
+  -O "$BAM_DEDUP" \
+  -M "$OUTDIR/${SAMPLE}.dup_metrics.txt" \
+  --conf 'spark.executor.cores=1' \
+  || gatk MarkDuplicates \
+       -I "$BAM_RG" \
+       -O "$BAM_DEDUP" \
+       -M "$OUTDIR/${SAMPLE}.dup_metrics.txt" \
+       --CREATE_INDEX true
+[ -e "${BAM_DEDUP}.bai" ] || samtools index "$BAM_DEDUP"
+
+# =======================================================
+# 4) RNA-seq GATK: SplitNCigarReads → HaplotypeCaller → filters
+# =======================================================
+log "Splitting CIGARs at introns (SplitNCigarReads)..."
+BAM_SPLIT="$OUTDIR/${SAMPLE}.split.bam"
+gatk SplitNCigarReads \
+  -R "$REF_FA" \
+  -I "$BAM_DEDUP" \
+  -O "$BAM_SPLIT"
+
+log "Variant calling with HaplotypeCaller (RNA-seq)..."
+VCF_RAW="$OUTDIR/${SAMPLE}.raw.vcf.gz"
+gatk HaplotypeCaller \
+  -R "$REF_FA" \
+  -I "$BAM_SPLIT" \
+  -O "$VCF_RAW"
+
+log "Applying hard filters suitable for RNA-seq calls..."
+VCF_FILT="$OUTDIR/${SAMPLE}.filtered.vcf.gz"
+gatk VariantFiltration \
+  -R "$REF_FA" \
+  -V "$VCF_RAW" \
+  -O "$VCF_FILT" \
+  --filter-name "QD2"          --filter-expression "QD < 2.0" \
+  --filter-name "FS30"         --filter-expression "FS > 30.0" \
+  --filter-name "MQ40"         --filter-expression "MQ < 40.0" \
+  --filter-name "SOR3"         --filter-expression "SOR > 3.0" \
+  --filter-name "MQRankSum-12" --filter-expression "MQRankSum < -12.5" \
+  --filter-name "ReadPos-8"    --filter-expression "ReadPosRankSum < -8.0"
+
+log "Keeping PASS variants on primary chromosomes only..."
+PRIMARY="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,X,Y,MT"
+VCF_PASS="$WORKDIR/sample_final_pass.vcf.gz"
+activate_env "$ENV_VEP"   # bcftools/tabix available here
+bcftools index -f "$VCF_FILT"
+bcftools view -f PASS -r "$PRIMARY" -Oz -o "$VCF_PASS" "$VCF_FILT"
+tabix -f -p vcf "$VCF_PASS"
+
+# ================================================
+# 5) VEP ANNOTATION (ensure TSL is included)
+# ================================================
+log "Annotating variants with VEP (TSL + useful fields + plugins)..."
+VCF_PRIMARY="$WORKDIR/sample_final_pass.primary.vcf.gz"
+bcftools view -r "$PRIMARY" -Oz -o "$VCF_PRIMARY" "$VCF_PASS"
+tabix -f -p vcf "$VCF_PRIMARY"
+
+VCF_VEP="$WORKDIR/sample_final_vep.tsl.vcf.gz"
+activate_env "$ENV_VEP"
+require_files "$REF_FA"
+vep -i "$VCF_PRIMARY" -o "$VCF_VEP" \
+  --vcf --compress_output bgzip \
+  --cache --offline --dir_cache "$VEP_CACHE" --assembly GRCh38 \
+  --fasta "$REF_FA" \
+  --symbol --biotype --hgvs --protein --canonical --tsl --fork 8 \
+  --plugin Wildtype --plugin Frameshift \
+  --force_overwrite --no_stats
+tabix -f -p vcf "$VCF_VEP"
+
+# Sanity check: confirm TSL is present in the CSQ header
+if zgrep -m1 '^##INFO=<ID=CSQ' "$VCF_VEP" | grep -q 'TSL'; then
+  log "VEP output contains TSL in the CSQ header."
+else
+  log "Warning: TSL not detected in CSQ header — check VEP configuration."
+fi
+
+# =====================================================
+# 6) pVACseq (MHC Class I) using MHCflurry predictions
+# =====================================================
+log "Running pVACseq (MHC Class I / MHCflurry) with your HLA alleles..."
+PVAC_OUT="$WORKDIR/pvacseq_out/mhci_final"
+mkdir -p "$PVAC_OUT"
+activate_env "$ENV_PVAC"
+
+# Ensure MHCflurry resources exist at least once on this machine:
+# mhcflurry-downloads fetch
+
+pvacseq run \
+  "$VCF_VEP" \
+  "$SAMPLE" \
+  MHCflurry \
+  "$HLA_LIST" \
+  "$PVAC_OUT"
+
+# Optional knobs you commonly use:
+# pvacseq run --peptide-lengths 8,9,10,11 --n-threads 8 --top-score-metric median \
+#   "$VCF_VEP" "$SAMPLE" MHCflurry "$HLA_LIST" "$PVAC_OUT"
+
+# =================
+# 7) QUICK INSPECT
+# =================
+log "Listing output directory content..."
+ls -lh "$PVAC_OUT" || true
+ls -lh "$PVAC_OUT/MHC_Class_I" || true
+
+log "Previewing first lines of the combined epitope table (if present)..."
+head -n 5 "$PVAC_OUT"/MHC_Class_I/*all_epitopes*.tsv 2>/dev/null || true
+
+log "DONE. Results live under: $WORKDIR  and  $PVAC_OUT"
