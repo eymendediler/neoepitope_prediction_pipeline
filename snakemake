@@ -1,0 +1,130 @@
+# =========================
+# Snakefile: Complete RNA-seq Neoepitope Prediction Pipeline
+# with STAR or kallisto, tmux usage, and SLURM integration
+# =========================
+
+# -------------------------
+# Configuration
+# -------------------------
+REF_FASTA = "Homo_sapiens.GRCh38.dna.primary_assembly.fa"
+REF_GTF = "Homo_sapiens.GRCh38.114.gtf"
+GENOME_DIR = "ref_index"
+FASTQ1 = "lung_cancer_srr11821874/SRR11821874_1.fastq.gz"
+FASTQ2 = "lung_cancer_srr11821874/SRR11821874_2.fastq.gz"
+SAMPLE = "tumor"
+ALIGNER = "STAR"   # or "KALLISTO"
+
+# -------------------------
+# Workflow rules
+# -------------------------
+rule all:
+    input:
+        "results/neoepitope_candidates.txt"
+
+rule genome_index:
+    output:
+        directory(GENOME_DIR)
+    run:
+        if ALIGNER == "STAR":
+            shell("STAR --runThreadN 16 --runMode genomeGenerate --genomeDir {output} "
+                  "--genomeFastaFiles {REF_FASTA} --sjdbGTFfile {REF_GTF} --sjdbOverhang 100")
+        elif ALIGNER == "KALLISTO":
+            shell("kallisto index -i {output}/transcripts.idx {REF_FASTA}")
+
+rule align:
+    input:
+        genome=GENOME_DIR,
+        fq1=FASTQ1,
+        fq2=FASTQ2
+    output:
+        bam="results/{sample}.Aligned.sortedByCoord.out.bam"
+    run:
+        if ALIGNER == "STAR":
+            shell("STAR --runThreadN 16 --genomeDir {input.genome} --readFilesIn {input.fq1} {input.fq2} "
+                  "--readFilesCommand zcat --outSAMtype BAM SortedByCoordinate --outFileNamePrefix results/{wildcards.sample}.")
+        elif ALIGNER == "KALLISTO":
+            shell("kallisto quant -i {input.genome}/transcripts.idx -o results/{wildcards.sample}_kallisto -b 100 {input.fq1} {input.fq2} && "
+                  "samtools view -bS results/{wildcards.sample}_kallisto/abundance.h5 > {output}")
+
+rule mark_duplicates:
+    input:
+        "results/{sample}.Aligned.sortedByCoord.out.bam"
+    output:
+        "results/{sample}.dedup.bam"
+    shell:
+        "picard MarkDuplicates I={input} O={output} M=results/{wildcards.sample}.dup_metrics.txt"
+
+rule split_n_cigar:
+    input:
+        "results/{sample}.dedup.bam"
+    output:
+        "results/{sample}.cleaned.bam"
+    shell:
+        "gatk SplitNCigarReads -R {REF_FASTA} -I {input} -O {output}"
+
+rule mutect2:
+    input:
+        "results/{sample}.cleaned.bam"
+    output:
+        "results/{sample}.filtered.vcf"
+    params:
+        gnomad="af-only-gnomad.vcf.gz",
+        pon="pon.vcf.gz"
+    shell:
+        "gatk Mutect2 -R {REF_FASTA} -I {input} --germline-resource {params.gnomad} --panel-of-normals {params.pon} -O results/{wildcards.sample}.unfiltered.vcf && "
+        "gatk FilterMutectCalls -V results/{wildcards.sample}.unfiltered.vcf -O {output}"
+
+rule optitype:
+    input:
+        fq1=FASTQ1,
+        fq2=FASTQ2
+    output:
+        "results/{sample}_optitype_result.tsv"
+    shell:
+        "OptiTypePipeline -i {input.fq1} {input.fq2} -r -o results/{wildcards.sample}_optitype"
+
+rule extract_peptides:
+    input:
+        vcf="results/{sample}.filtered.vcf"
+    output:
+        "results/{sample}_peptides.fa"
+    shell:
+        "python extract_peptides.py {input.vcf} > {output}"
+
+rule netmhcpan:
+    input:
+        peptides="results/{sample}_peptides.fa",
+        hla="results/{sample}_optitype_result.tsv"
+    output:
+        "results/neoepitope_candidates.txt"
+    shell:
+        "netMHCpan -a $(cut -f2 {input.hla} | tr '\n' ',') -f {input.peptides} -BA > {output}"
+
+# -------------------------
+# tmux usage instructions
+# -------------------------
+# Start a tmux session:
+#   tmux new -s rnaseq
+# Detach from session:
+#   Ctrl+b then d
+# Reattach:
+#   tmux attach -t rnaseq
+# Split panels:
+#   Ctrl+b then %   (vertical)
+#   Ctrl+b then "   (horizontal)
+
+# -------------------------
+# SLURM usage instructions
+# -------------------------
+# To run this Snakefile on SLURM, you can either:
+# 1. Submit Snakemake itself as a job:
+#    sbatch --cpus-per-task=16 --mem=50G --time=48:00:00 --wrap "snakemake --cores 16"
+#
+# 2. Use a Snakemake SLURM profile so each rule is submitted as its own SLURM job.
+#    Install profile: snakemake --help | grep profile
+#    Example run: snakemake --profile slurm --jobs 20
+#
+# Logs and errors will be captured in the usual SLURM output/error files.
+
+# End of Snakefile
+
